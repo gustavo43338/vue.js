@@ -68,6 +68,51 @@ const notificacionesNoLeidas = computed(() =>
   notificaciones.value.filter(n => !n.leida).length
 )
 
+// Estados HTTP: carga en botones + alerta con transición al resolver
+const loading = ref({})
+const alerta = ref({ visible: false, tipo: 'success', mensaje: '' })
+let alertaTimer = null
+
+const estaCargando = (key) => Boolean(loading.value[key])
+
+const cerrarAlerta = () => {
+  alerta.value.visible = false
+  if (alertaTimer) {
+    clearTimeout(alertaTimer)
+    alertaTimer = null
+  }
+}
+
+const mostrarAlerta = (tipo, mensaje) => {
+  if (alertaTimer) clearTimeout(alertaTimer)
+  alerta.value = { visible: true, tipo, mensaje }
+  alertaTimer = setTimeout(cerrarAlerta, 5000)
+}
+
+const ejecutarPeticion = async (key, fn, { exito, error } = {}) => {
+  if (loading.value[key]) return
+
+  loading.value = { ...loading.value, [key]: true }
+  try {
+    const resultado = await fn()
+    mostrarAlerta('success', exito || 'Operación completada correctamente')
+    return resultado
+  } catch (err) {
+    const mensaje =
+      error ||
+      err?.response?.data?.error ||
+      err?.response?.data?.message ||
+      (err?.response?.status >= 500
+        ? 'Error del servidor. Verifica que Laravel esté corriendo y la base de datos configurada.'
+        : null) ||
+      err?.message ||
+      'No se pudo completar la solicitud'
+    mostrarAlerta('error', mensaje)
+  } finally {
+    loading.value = { ...loading.value, [key]: false }
+  }
+}
+
 const formatearHora = (fecha) => {
   if (!fecha) return ''
   const date = new Date(fecha)
@@ -92,31 +137,34 @@ const extraerNombre = (email) => {
   return email.split('@')[0]
 }
 
-const login = async () => {
-  try {
-    const response = await axios.post(
-      'http://127.0.0.1:8000/api/login',
-      {
-        correo: email.value,
-        password: password.value
+const login = () =>
+  ejecutarPeticion(
+    'login',
+    async () => {
+      const response = await axios.post('http://127.0.0.1:8000/api/login', {
+        correo: email.value.trim(),
+        password: password.value,
+      })
+
+      if (!response.data?.ok || !response.data?.usuario) {
+        throw new Error('Credenciales incorrectas')
       }
-    )
 
-    const usuario = response.data.usuario
-    localStorage.setItem('usuario', JSON.stringify(usuario))
-    usuarioActual.value = usuario
+      const usuario = response.data.usuario
+      localStorage.setItem('usuario', JSON.stringify(usuario))
+      usuarioActual.value = usuario
 
-    cargarMensajes()
-    cargarNotificaciones()
-    escucharNotificaciones()
-    if (usuario.rol === 'admin') {
-      cargarUsuarios()
-    }
-
-  } catch (error) {
-    alert('Credenciales incorrectas')
-  }
-}
+      await Promise.all([
+        cargarMensajes(),
+        cargarNotificaciones(),
+      ])
+      escucharNotificaciones()
+      if (usuario.rol === 'admin') {
+        await cargarUsuarios()
+      }
+    },
+    { exito: 'Sesión iniciada correctamente', error: 'Credenciales incorrectas' }
+  )
 
 const logout = () => {
   localStorage.removeItem('usuario')
@@ -140,94 +188,105 @@ const cargarUsuarios = async () => {
   }
 }
 
-const crearMulta = async () => {
+const crearMulta = () => {
   if (!esAdmin.value) return
-  if (!adminUsuarioIdDestino.value) return alert('Selecciona un usuario destino')
-
-  try {
-    await axios.post('http://127.0.0.1:8000/api/multas', {
-      admin_id: usuarioActual.value.id,
-      usuario_id: adminUsuarioIdDestino.value,
-      descripcion: formMulta.value.descripcion,
-      monto: Number(formMulta.value.monto),
-      detalles: formMulta.value.detalles || null,
-      estado: 'pendiente',
-    })
-
-    formMulta.value = { descripcion: '', monto: 0, detalles: '' }
-  } catch (error) {
-    console.error('Error creando multa:', error)
-    alert('No se pudo crear la multa (revisa consola)')
+  if (!adminUsuarioIdDestino.value) {
+    mostrarAlerta('error', 'Selecciona un usuario destino')
+    return
   }
+
+  return ejecutarPeticion(
+    'multa',
+    async () => {
+      await axios.post('http://127.0.0.1:8000/api/multas', {
+        admin_id: usuarioActual.value.id,
+        usuario_id: adminUsuarioIdDestino.value,
+        descripcion: formMulta.value.descripcion,
+        monto: Number(formMulta.value.monto),
+        detalles: formMulta.value.detalles || null,
+        estado: 'pendiente',
+      })
+      formMulta.value = { descripcion: '', monto: 0, detalles: '' }
+    },
+    { exito: 'Multa creada correctamente', error: 'No se pudo crear la multa' }
+  )
 }
 
-const crearPagoAtrasado = async () => {
+const crearPagoAtrasado = () => {
   if (!esAdmin.value) return
-  if (!adminUsuarioIdDestino.value) return alert('Selecciona un usuario destino')
-
-  try {
-    await axios.post('http://127.0.0.1:8000/api/pagos-atrasados', {
-      admin_id: usuarioActual.value.id,
-      usuario_id: adminUsuarioIdDestino.value,
-      concepto: formPago.value.concepto,
-      monto: Number(formPago.value.monto),
-      dias_atraso: Number(formPago.value.dias_atraso),
-      fecha_vencimiento: formPago.value.fecha_vencimiento,
-      detalles: formPago.value.detalles || null,
-    })
-
-    formPago.value = {
-      concepto: '',
-      monto: 0,
-      dias_atraso: 0,
-      fecha_vencimiento: '',
-      detalles: '',
-    }
-  } catch (error) {
-    console.error('Error creando pago atrasado:', error)
-    alert('No se pudo crear el pago atrasado (revisa consola)')
+  if (!adminUsuarioIdDestino.value) {
+    mostrarAlerta('error', 'Selecciona un usuario destino')
+    return
   }
-}
 
-const crearAsamblea = async () => {
-  if (!esAdmin.value) return
-
-  try {
-    await axios.post('http://127.0.0.1:8000/api/asambleas', {
-      admin_id: usuarioActual.value.id,
-      titulo: formAsamblea.value.titulo,
-      descripcion: formAsamblea.value.descripcion,
-      fecha: formAsamblea.value.fecha,
-      lugar: formAsamblea.value.lugar,
-      agenda: formAsamblea.value.agenda || null,
-      estado: 'programada',
-    })
-
-    formAsamblea.value = {
-      titulo: '',
-      descripcion: '',
-      fecha: '',
-      lugar: '',
-      agenda: '',
-    }
-  } catch (error) {
-    console.error('Error creando asamblea:', error)
-    alert('No se pudo crear la asamblea (revisa consola)')
-  }
-}
-
-const enviar = async () => {
-  if (!mensaje.value) return
-
-  await axios.post(
-    'http://127.0.0.1:8000/api/mensaje',
+  return ejecutarPeticion(
+    'pago',
+    async () => {
+      await axios.post('http://127.0.0.1:8000/api/pagos-atrasados', {
+        admin_id: usuarioActual.value.id,
+        usuario_id: adminUsuarioIdDestino.value,
+        concepto: formPago.value.concepto,
+        monto: Number(formPago.value.monto),
+        dias_atraso: Number(formPago.value.dias_atraso),
+        fecha_vencimiento: formPago.value.fecha_vencimiento,
+        detalles: formPago.value.detalles || null,
+      })
+      formPago.value = {
+        concepto: '',
+        monto: 0,
+        dias_atraso: 0,
+        fecha_vencimiento: '',
+        detalles: '',
+      }
+    },
     {
-      usuario: usuarioActual.value.correo,
-      mensaje: mensaje.value
+      exito: 'Pago atrasado registrado correctamente',
+      error: 'No se pudo crear el pago atrasado',
     }
   )
+}
 
-  mensaje.value = ''
+const crearAsamblea = () => {
+  if (!esAdmin.value) return
+
+  return ejecutarPeticion(
+    'asamblea',
+    async () => {
+      await axios.post('http://127.0.0.1:8000/api/asambleas', {
+        admin_id: usuarioActual.value.id,
+        titulo: formAsamblea.value.titulo,
+        descripcion: formAsamblea.value.descripcion,
+        fecha: formAsamblea.value.fecha,
+        lugar: formAsamblea.value.lugar,
+        agenda: formAsamblea.value.agenda || null,
+        estado: 'programada',
+      })
+      formAsamblea.value = {
+        titulo: '',
+        descripcion: '',
+        fecha: '',
+        lugar: '',
+        agenda: '',
+      }
+    },
+    { exito: 'Asamblea creada correctamente', error: 'No se pudo crear la asamblea' }
+  )
+}
+
+const enviar = () => {
+  if (!mensaje.value) return
+
+  return ejecutarPeticion(
+    'mensaje',
+    async () => {
+      await axios.post('http://127.0.0.1:8000/api/mensaje', {
+        usuario: usuarioActual.value.correo,
+        mensaje: mensaje.value,
+      })
+      mensaje.value = ''
+    },
+    { exito: 'Mensaje enviado', error: 'No se pudo enviar el mensaje' }
+  )
 }
 
 const cargarMensajes = async () => {
@@ -257,17 +316,21 @@ const cargarNotificaciones = async () => {
   }
 }
 
-const marcarComoLeida = async (notificacion) => {
-  try {
-    await axios.put(
-      `http://127.0.0.1:8000/api/notificaciones/${notificacion.id}/leida`
-    )
-    notificacion.leida = true
-    notificacionSeleccionada.value = notificacion
-  } catch (error) {
-    console.error('Error marcando como leída:', error)
-  }
-}
+const marcarComoLeida = (notificacion) =>
+  ejecutarPeticion(
+    `leida-${notificacion.id}`,
+    async () => {
+      await axios.put(
+        `http://127.0.0.1:8000/api/notificaciones/${notificacion.id}/leida`
+      )
+      notificacion.leida = true
+      notificacionSeleccionada.value = notificacion
+    },
+    {
+      exito: 'Notificación marcada como leída',
+      error: 'No se pudo marcar la notificación',
+    }
+  )
 
 const verDetalles = (notificacion) => {
   if (!notificacion.leida) {
@@ -355,7 +418,19 @@ onMounted(() => {
         <a class="auth-link" href="javascript:void(0)">¿Olvidaste tu contraseña?</a>
       </div>
 
-      <button class="auth-btn" @click="login">Iniciar Sesión</button>
+      <button
+        class="auth-btn"
+        :disabled="estaCargando('login')"
+        @click="login"
+      >
+        <Transition name="btn-swap" mode="out-in">
+          <span v-if="estaCargando('login')" key="loading" class="btn-estado btn-estado--loading">
+            <span class="spinner" aria-hidden="true" />
+            Cargando...
+          </span>
+          <span v-else key="idle" class="btn-estado">Iniciar Sesión</span>
+        </Transition>
+      </button>
 
       <div class="auth-footnote">
         Sistema de Administración de Condominios v1.0
@@ -452,7 +527,19 @@ onMounted(() => {
               <input v-model="formMulta.descripcion" placeholder="Descripción" />
               <input v-model="formMulta.monto" type="number" step="0.01" placeholder="Monto" />
               <input v-model="formMulta.detalles" placeholder="Detalles (opcional)" />
-              <button class="admin-btn" @click="crearMulta">Crear multa</button>
+              <button
+                class="admin-btn"
+                :disabled="estaCargando('multa')"
+                @click="crearMulta"
+              >
+                <Transition name="btn-swap" mode="out-in">
+                  <span v-if="estaCargando('multa')" key="loading" class="btn-estado btn-estado--loading">
+                    <span class="spinner" aria-hidden="true" />
+                    Cargando...
+                  </span>
+                  <span v-else key="idle" class="btn-estado">Crear multa</span>
+                </Transition>
+              </button>
             </div>
 
             <div class="admin-card">
@@ -462,7 +549,19 @@ onMounted(() => {
               <input v-model="formPago.dias_atraso" type="number" placeholder="Días de atraso" />
               <input v-model="formPago.fecha_vencimiento" type="datetime-local" />
               <input v-model="formPago.detalles" placeholder="Detalles (opcional)" />
-              <button class="admin-btn" @click="crearPagoAtrasado">Crear pago atrasado</button>
+              <button
+                class="admin-btn"
+                :disabled="estaCargando('pago')"
+                @click="crearPagoAtrasado"
+              >
+                <Transition name="btn-swap" mode="out-in">
+                  <span v-if="estaCargando('pago')" key="loading" class="btn-estado btn-estado--loading">
+                    <span class="spinner" aria-hidden="true" />
+                    Cargando...
+                  </span>
+                  <span v-else key="idle" class="btn-estado">Crear pago atrasado</span>
+                </Transition>
+              </button>
             </div>
 
             <div class="admin-card">
@@ -472,7 +571,19 @@ onMounted(() => {
               <input v-model="formAsamblea.fecha" type="datetime-local" />
               <input v-model="formAsamblea.lugar" placeholder="Lugar" />
               <input v-model="formAsamblea.agenda" placeholder="Agenda (opcional)" />
-              <button class="admin-btn" @click="crearAsamblea">Crear asamblea</button>
+              <button
+                class="admin-btn"
+                :disabled="estaCargando('asamblea')"
+                @click="crearAsamblea"
+              >
+                <Transition name="btn-swap" mode="out-in">
+                  <span v-if="estaCargando('asamblea')" key="loading" class="btn-estado btn-estado--loading">
+                    <span class="spinner" aria-hidden="true" />
+                    Cargando...
+                  </span>
+                  <span v-else key="idle" class="btn-estado">Crear asamblea</span>
+                </Transition>
+              </button>
             </div>
           </div>
         </div>
@@ -524,8 +635,17 @@ onMounted(() => {
               @keyup.enter="enviar"
             />
 
-            <button @click="enviar" class="send-btn">
-              ➤
+            <button
+              class="send-btn"
+              :disabled="estaCargando('mensaje')"
+              @click="enviar"
+            >
+              <Transition name="btn-swap" mode="out-in">
+                <span v-if="estaCargando('mensaje')" key="loading" class="btn-estado btn-estado--loading">
+                  <span class="spinner spinner--light" aria-hidden="true" />
+                </span>
+                <span v-else key="idle" class="btn-estado">➤</span>
+              </Transition>
             </button>
           </div>
         </div>
@@ -616,6 +736,23 @@ onMounted(() => {
     </div>
     </main>
   </div>
+
+  <!-- Alerta global: resultado de la promesa HTTP -->
+  <Transition name="alert-slide">
+    <div
+      v-if="alerta.visible"
+      :class="['api-alerta', `api-alerta--${alerta.tipo}`]"
+      role="alert"
+    >
+      <Transition name="alert-icon" mode="out-in">
+        <span :key="alerta.tipo" class="api-alerta-ico">
+          {{ alerta.tipo === 'success' ? '✓' : '!' }}
+        </span>
+      </Transition>
+      <p class="api-alerta-texto">{{ alerta.mensaje }}</p>
+      <button type="button" class="api-alerta-cerrar" @click="cerrarAlerta">✕</button>
+    </div>
+  </Transition>
 
 </div>
 
@@ -1560,9 +1697,169 @@ body {
   transform: scale(1.05);
 }
 
+/* Transiciones Vue: botones HTTP (enter/leave) */
+.btn-estado {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btn-estado--loading {
+  opacity: 0.95;
+}
+
+.btn-swap-enter-active,
+.btn-swap-leave-active {
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+
+.btn-swap-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.btn-swap-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(15, 23, 42, 0.15);
+  border-top-color: #0f172a;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.spinner--light {
+  border-color: rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.auth-btn:disabled,
+.admin-btn:disabled,
+.send-btn:disabled {
+  opacity: 0.72;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Transiciones Vue: alerta resultado promesa */
+.api-alerta {
+  position: fixed;
+  top: 22px;
+  right: 22px;
+  z-index: 9999;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 280px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 14px 16px;
+  border-radius: 14px;
+  box-shadow: 0 18px 50px rgba(15, 23, 42, 0.18);
+  border: 1px solid transparent;
+}
+
+.api-alerta--success {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.api-alerta--error {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+
+.api-alerta-ico {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-weight: 900;
+  flex-shrink: 0;
+}
+
+.api-alerta--success .api-alerta-ico {
+  background: #10b981;
+  color: #fff;
+}
+
+.api-alerta--error .api-alerta-ico {
+  background: #ef4444;
+  color: #fff;
+}
+
+.api-alerta-texto {
+  margin: 0;
+  flex: 1;
+  font-size: 14px;
+  line-height: 1.45;
+  font-weight: 600;
+  padding-top: 4px;
+}
+
+.api-alerta-cerrar {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0.55;
+  font-size: 14px;
+  padding: 2px 4px;
+}
+
+.api-alerta-cerrar:hover {
+  opacity: 1;
+}
+
+.alert-slide-enter-active,
+.alert-slide-leave-active {
+  transition: opacity 0.35s ease, transform 0.35s ease;
+}
+
+.alert-slide-enter-from,
+.alert-slide-leave-to {
+  opacity: 0;
+  transform: translateY(-14px) scale(0.96);
+}
+
+.alert-slide-enter-to,
+.alert-slide-leave-from {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.alert-icon-enter-active,
+.alert-icon-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.alert-icon-enter-from,
+.alert-icon-leave-to {
+  opacity: 0;
+  transform: scale(0.6);
+}
+
 @media (max-width: 768px) {
   .shell {
     grid-template-columns: 1fr;
+  }
+
+  .api-alerta {
+    left: 16px;
+    right: 16px;
+    min-width: auto;
   }
 
   .sidebar {
