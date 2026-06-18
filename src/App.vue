@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
-import axios from 'axios'
+import api, { guardarSesion, limpiarSesion, obtenerToken } from './api'
 import echo from './echo'
 
 const email = ref('')
@@ -17,6 +17,156 @@ try {
 
 const esAdmin = computed(() => usuarioActual.value?.rol === 'admin')
 
+const vistaActual = ref('dashboard')
+const buscarResidente = ref('')
+const formUsuario = ref({
+  id: null,
+  nombre: '',
+  correo: '',
+  password: '',
+  rol: 'usuario',
+})
+
+const pendienteVerificacion = ref(false)
+const correoPendiente = ref('')
+
+const residentesFiltrados = computed(() => {
+  const q = buscarResidente.value.trim().toLowerCase()
+  return usuarios.value.filter((u) => {
+    if (u.rol === 'admin') return false
+    if (!q) return true
+    return (
+      u.nombre?.toLowerCase().includes(q) ||
+      u.correo?.toLowerCase().includes(q)
+    )
+  })
+})
+
+const tituloVista = computed(() => {
+  if (vistaActual.value === 'residentes') return 'Residentes'
+  if (vistaActual.value === 'mensajes') return 'Mensajes'
+  return esAdmin.value ? 'Panel de Administración' : 'Dashboard'
+})
+
+const subtituloVista = computed(() => {
+  if (vistaActual.value === 'residentes') return 'Gestiona la información de los residentes'
+  if (vistaActual.value === 'mensajes') return 'Conversación general del condominio'
+  return esAdmin.value
+    ? 'Condominio — multas, pagos y asambleas'
+    : 'Vista general del condominio'
+})
+
+const cambiarVista = (vista) => {
+  vistaActual.value = vista
+}
+
+const iniciales = (nombre) => {
+  if (!nombre) return '?'
+  return nombre
+    .split(' ')
+    .map((p) => p[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase()
+}
+
+const estaVerificado = (u) => Boolean(u.email_verified_at)
+
+const abrirFormUsuario = (usuario = null) => {
+  if (usuario) {
+    formUsuario.value = {
+      id: usuario.id,
+      nombre: usuario.nombre,
+      correo: usuario.correo,
+      password: '',
+      rol: usuario.rol,
+    }
+  } else {
+    formUsuario.value = {
+      id: null,
+      nombre: '',
+      correo: '',
+      password: '',
+      rol: 'usuario',
+    }
+  }
+  abrirModal('usuario')
+}
+
+const guardarUsuario = () => {
+  if (!formUsuario.value.nombre || !formUsuario.value.correo) {
+    mostrarAlerta('error', 'Nombre y correo son obligatorios')
+    return
+  }
+  if (!formUsuario.value.id && !formUsuario.value.password) {
+    mostrarAlerta('error', 'La contraseña es obligatoria para nuevos usuarios')
+    return
+  }
+
+  const esEdicion = Boolean(formUsuario.value.id)
+  const key = esEdicion ? `usuario-edit-${formUsuario.value.id}` : 'usuario-create'
+
+  return ejecutarPeticion(
+    key,
+    async () => {
+      const payload = {
+        nombre: formUsuario.value.nombre,
+        correo: formUsuario.value.correo,
+        rol: formUsuario.value.rol,
+      }
+      if (formUsuario.value.password) {
+        payload.password = formUsuario.value.password
+      }
+
+      if (esEdicion) {
+        await api.put(`/usuarios/${formUsuario.value.id}`, payload)
+        agregarHistorial(
+          'mensaje',
+          'Residente actualizado',
+          `${formUsuario.value.nombre} (${formUsuario.value.correo})`
+        )
+      } else {
+        await api.post('/usuarios', { ...payload, password: formUsuario.value.password })
+        agregarHistorial(
+          'mensaje',
+          'Usuario registrado',
+          `${formUsuario.value.nombre} — correo de verificación enviado`
+        )
+      }
+
+      cerrarModal()
+      await cargarUsuarios()
+    },
+    {
+      exito: esEdicion ? 'Usuario actualizado' : 'Usuario creado. Se envió correo de verificación.',
+      error: 'No se pudo guardar el usuario',
+    }
+  )
+}
+
+const eliminarUsuario = (usuario) => {
+  if (!confirm(`¿Eliminar a ${usuario.nombre}?`)) return
+
+  return ejecutarPeticion(
+    `usuario-del-${usuario.id}`,
+    async () => {
+      await api.delete(`/usuarios/${usuario.id}`)
+      agregarHistorial('mensaje', 'Usuario eliminado', usuario.nombre)
+      await cargarUsuarios()
+    },
+    { exito: 'Usuario eliminado', error: 'No se pudo eliminar' }
+  )
+}
+
+const reenviarVerificacion = (usuario) =>
+  ejecutarPeticion(
+    `verif-${usuario.id}`,
+    async () => {
+      await api.post(`/usuarios/${usuario.id}/reenviar-verificacion`)
+    },
+    { exito: `Correo reenviado a ${usuario.correo}`, error: 'No se pudo reenviar' }
+  )
+
 const mensaje = ref('')
 const mensajes = ref([])
 
@@ -28,7 +178,92 @@ const formMulta = ref({
   descripcion: '',
   monto: 0,
   detalles: '',
+  estado: 'pendiente',
+  fecha_vencimiento: '',
 })
+
+const modalActivo = ref(null)
+const multasLista = ref([])
+const historial = ref([])
+
+const abrirModal = (tipo) => {
+  modalActivo.value = tipo
+}
+
+const cerrarModal = () => {
+  modalActivo.value = null
+}
+
+const agregarHistorial = (tipo, titulo, subtitulo) => {
+  const entrada = {
+    id: Date.now(),
+    tipo,
+    titulo,
+    subtitulo,
+    fecha: new Date().toISOString(),
+  }
+  historial.value = [entrada, ...historial.value].slice(0, 40)
+  localStorage.setItem('admin_historial', JSON.stringify(historial.value))
+}
+
+const cargarHistorial = () => {
+  try {
+    const raw = localStorage.getItem('admin_historial')
+    historial.value = raw ? JSON.parse(raw) : []
+  } catch {
+    historial.value = []
+  }
+}
+
+const haceCuanto = (fecha) => {
+  if (!fecha) return ''
+  const diff = Date.now() - new Date(fecha).getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return 'Hace un momento'
+  if (mins < 60) return `Hace ${mins} min`
+  const horas = Math.floor(mins / 60)
+  if (horas < 24) return `Hace ${horas} h`
+  const dias = Math.floor(horas / 24)
+  return `Hace ${dias} d`
+}
+
+const nombreResidente = (usuarioId) => {
+  const u = usuarios.value.find((x) => x.id === usuarioId)
+  return u?.nombre || `Residente #${usuarioId}`
+}
+
+const cargarMultasAdmin = async () => {
+  if (!esAdmin.value) return
+  const residentes = usuarios.value.filter((u) => u.rol !== 'admin')
+  const todas = []
+  for (const u of residentes) {
+    try {
+      const { data } = await api.get(`/multas/usuario/${u.id}`)
+      data.forEach((m) =>
+        todas.push({
+          ...m,
+          residente_nombre: u.nombre,
+          residente_correo: u.correo,
+        })
+      )
+    } catch (e) {
+      console.error('Error cargando multas:', e)
+    }
+  }
+  multasLista.value = todas.sort(
+    (a, b) => new Date(b.created_at) - new Date(a.created_at)
+  )
+}
+
+const resetFormMulta = () => {
+  formMulta.value = {
+    descripcion: '',
+    monto: 0,
+    detalles: '',
+    estado: 'pendiente',
+    fecha_vencimiento: '',
+  }
+}
 
 const formPago = ref({
   concepto: '',
@@ -137,47 +372,64 @@ const extraerNombre = (email) => {
   return email.split('@')[0]
 }
 
-const login = () =>
-  ejecutarPeticion(
+const login = () => {
+  pendienteVerificacion.value = false
+  return ejecutarPeticion(
     'login',
     async () => {
-      const response = await axios.post('http://127.0.0.1:8000/api/login', {
-        correo: email.value.trim(),
-        password: password.value,
-      })
+      try {
+        const response = await api.post('/login', {
+          correo: email.value.trim(),
+          password: password.value,
+        })
 
-      if (!response.data?.ok || !response.data?.usuario) {
-        throw new Error('Credenciales incorrectas')
-      }
+        if (!response.data?.ok || !response.data?.token) {
+          throw new Error('Credenciales incorrectas')
+        }
 
-      const usuario = response.data.usuario
-      localStorage.setItem('usuario', JSON.stringify(usuario))
-      usuarioActual.value = usuario
+        guardarSesion(response.data.token, response.data.usuario)
+        usuarioActual.value = response.data.usuario
 
-      await Promise.all([
-        cargarMensajes(),
-        cargarNotificaciones(),
-      ])
-      escucharNotificaciones()
-      if (usuario.rol === 'admin') {
-        await cargarUsuarios()
+        await Promise.all([cargarMensajes(), cargarNotificaciones()])
+        escucharNotificaciones()
+        if (response.data.usuario.rol === 'admin') {
+          await cargarUsuarios()
+          cargarHistorial()
+          await cargarMultasAdmin()
+        }
+      } catch (err) {
+        if (err.response?.data?.requiere_verificacion) {
+          pendienteVerificacion.value = true
+          correoPendiente.value = err.response.data.correo || email.value
+        }
+        throw err
       }
     },
     { exito: 'Sesión iniciada correctamente', error: 'Credenciales incorrectas' }
   )
+}
 
-const logout = () => {
-  localStorage.removeItem('usuario')
+const logout = async () => {
+  try {
+    if (obtenerToken()) await api.post('/logout')
+  } catch {
+    /* ignorar */
+  }
+  limpiarSesion()
   usuarioActual.value = null
   notificaciones.value = []
   mensajes.value = []
   usuarios.value = []
   adminUsuarioIdDestino.value = null
+  multasLista.value = []
+  modalActivo.value = null
+  vistaActual.value = 'dashboard'
+  pendienteVerificacion.value = false
 }
 
 const cargarUsuarios = async () => {
   try {
-    const response = await axios.get('http://127.0.0.1:8000/api/usuarios')
+    const response = await api.get('/usuarios')
     usuarios.value = response.data
     if (!adminUsuarioIdDestino.value && usuarios.value.length > 0) {
       const primerNoAdmin = usuarios.value.find(u => u.rol !== 'admin')
@@ -198,15 +450,23 @@ const crearMulta = () => {
   return ejecutarPeticion(
     'multa',
     async () => {
-      await axios.post('http://127.0.0.1:8000/api/multas', {
-        admin_id: usuarioActual.value.id,
+      await api.post('/multas', {
         usuario_id: adminUsuarioIdDestino.value,
         descripcion: formMulta.value.descripcion,
         monto: Number(formMulta.value.monto),
         detalles: formMulta.value.detalles || null,
-        estado: 'pendiente',
+        estado: formMulta.value.estado,
+        fecha_vencimiento: formMulta.value.fecha_vencimiento || null,
       })
-      formMulta.value = { descripcion: '', monto: 0, detalles: '' }
+      const residente = nombreResidente(adminUsuarioIdDestino.value)
+      agregarHistorial(
+        'multa',
+        'Multa registrada',
+        `${residente} — ${formMulta.value.descripcion} ($${Number(formMulta.value.monto).toFixed(2)})`
+      )
+      resetFormMulta()
+      cerrarModal()
+      await cargarMultasAdmin()
     },
     { exito: 'Multa creada correctamente', error: 'No se pudo crear la multa' }
   )
@@ -222,8 +482,7 @@ const crearPagoAtrasado = () => {
   return ejecutarPeticion(
     'pago',
     async () => {
-      await axios.post('http://127.0.0.1:8000/api/pagos-atrasados', {
-        admin_id: usuarioActual.value.id,
+      await api.post('/pagos-atrasados', {
         usuario_id: adminUsuarioIdDestino.value,
         concepto: formPago.value.concepto,
         monto: Number(formPago.value.monto),
@@ -231,6 +490,12 @@ const crearPagoAtrasado = () => {
         fecha_vencimiento: formPago.value.fecha_vencimiento,
         detalles: formPago.value.detalles || null,
       })
+      const residente = nombreResidente(adminUsuarioIdDestino.value)
+      agregarHistorial(
+        'pago_atrasado',
+        'Pago atrasado registrado',
+        `${residente} — ${formPago.value.concepto} (${formPago.value.dias_atraso} días)`
+      )
       formPago.value = {
         concepto: '',
         monto: 0,
@@ -238,6 +503,7 @@ const crearPagoAtrasado = () => {
         fecha_vencimiento: '',
         detalles: '',
       }
+      cerrarModal()
     },
     {
       exito: 'Pago atrasado registrado correctamente',
@@ -252,8 +518,7 @@ const crearAsamblea = () => {
   return ejecutarPeticion(
     'asamblea',
     async () => {
-      await axios.post('http://127.0.0.1:8000/api/asambleas', {
-        admin_id: usuarioActual.value.id,
+      await api.post('/asambleas', {
         titulo: formAsamblea.value.titulo,
         descripcion: formAsamblea.value.descripcion,
         fecha: formAsamblea.value.fecha,
@@ -261,6 +526,8 @@ const crearAsamblea = () => {
         agenda: formAsamblea.value.agenda || null,
         estado: 'programada',
       })
+      const tituloAsm = formAsamblea.value.titulo
+      const lugarAsm = formAsamblea.value.lugar
       formAsamblea.value = {
         titulo: '',
         descripcion: '',
@@ -268,6 +535,12 @@ const crearAsamblea = () => {
         lugar: '',
         agenda: '',
       }
+      agregarHistorial(
+        'asamblea',
+        'Asamblea programada',
+        `${tituloAsm} — ${lugarAsm}`
+      )
+      cerrarModal()
     },
     { exito: 'Asamblea creada correctamente', error: 'No se pudo crear la asamblea' }
   )
@@ -279,8 +552,7 @@ const enviar = () => {
   return ejecutarPeticion(
     'mensaje',
     async () => {
-      await axios.post('http://127.0.0.1:8000/api/mensaje', {
-        usuario: usuarioActual.value.correo,
+      await api.post('/mensaje', {
         mensaje: mensaje.value,
       })
       mensaje.value = ''
@@ -291,9 +563,7 @@ const enviar = () => {
 
 const cargarMensajes = async () => {
   try {
-    const response = await axios.get(
-      'http://127.0.0.1:8000/api/mensajes'
-    )
+    const response = await api.get('/mensajes')
     mensajes.value = response.data
   } catch (error) {
     console.error('Error cargando mensajes:', error)
@@ -304,12 +574,9 @@ const cargarNotificaciones = async () => {
   try {
     if (!usuarioActual.value) return
     
-    const response = await axios.get(
-      `http://127.0.0.1:8000/api/notificaciones/`,
-      {
-        params: { usuario_id: usuarioActual.value.id }
-      }
-    )
+    const response = await api.get('/notificaciones/', {
+      params: { usuario_id: usuarioActual.value.id },
+    })
     notificaciones.value = response.data
   } catch (error) {
     console.error('Error cargando notificaciones:', error)
@@ -320,9 +587,7 @@ const marcarComoLeida = (notificacion) =>
   ejecutarPeticion(
     `leida-${notificacion.id}`,
     async () => {
-      await axios.put(
-        `http://127.0.0.1:8000/api/notificaciones/${notificacion.id}/leida`
-      )
+      await api.put(`/notificaciones/${notificacion.id}/leida`)
       notificacion.leida = true
       notificacionSeleccionada.value = notificacion
     },
@@ -368,11 +633,35 @@ const escucharNotificaciones = () => {
     })
 }
 
-onMounted(() => {
-  if (usuarioActual.value) {
+onMounted(async () => {
+  const params = new URLSearchParams(window.location.search)
+  if (params.get('correo_verificado') === '1') {
+    mostrarAlerta('success', '¡Correo verificado! Ya puedes iniciar sesión.')
+    window.history.replaceState({}, '', window.location.pathname)
+  }
+
+  if (usuarioActual.value && obtenerToken()) {
+    try {
+      const { data } = await api.get('/me')
+      usuarioActual.value = data.usuario
+      guardarSesion(obtenerToken(), data.usuario)
+    } catch {
+      limpiarSesion()
+      usuarioActual.value = null
+      return
+    }
+
     cargarMensajes()
     cargarNotificaciones()
     escucharNotificaciones()
+    if (usuarioActual.value.rol === 'admin') {
+      await cargarUsuarios()
+      cargarHistorial()
+      await cargarMultasAdmin()
+    }
+  } else if (usuarioActual.value && !obtenerToken()) {
+    limpiarSesion()
+    usuarioActual.value = null
   }
 
   echo.channel('chat-channel')
@@ -380,7 +669,7 @@ onMounted(() => {
       mensajes.value.push({
         usuario: e.usuario,
         mensaje: e.mensaje,
-        created_at: e.created_at || new Date().toISOString()
+        created_at: e.created_at || new Date().toISOString(),
       })
     })
 })
@@ -439,6 +728,15 @@ onMounted(() => {
       <div class="users">
         Demo: juan@gmail.com / maria@gmail.com / admin@gmail.com (password: 123)
       </div>
+
+      <Transition name="alert-slide">
+        <div v-if="pendienteVerificacion" class="auth-verify-banner">
+          <p>
+            Debes verificar <strong>{{ correoPendiente }}</strong> antes de entrar.
+            Revisa tu bandeja de entrada (y spam).
+          </p>
+        </div>
+      </Transition>
     </div>
   </div>
 
@@ -451,15 +749,31 @@ onMounted(() => {
       </div>
 
       <nav class="nav">
-        <a class="nav-item is-active" href="javascript:void(0)">
+        <a
+          class="nav-item"
+          :class="{ 'is-active': vistaActual === 'dashboard' }"
+          href="javascript:void(0)"
+          @click="cambiarVista('dashboard')"
+        >
           <span class="nav-ico">▦</span>
           <span>Dashboard</span>
         </a>
-        <a class="nav-item" href="javascript:void(0)">
+        <a
+          v-if="esAdmin"
+          class="nav-item"
+          :class="{ 'is-active': vistaActual === 'residentes' }"
+          href="javascript:void(0)"
+          @click="cambiarVista('residentes')"
+        >
           <span class="nav-ico">👥</span>
           <span>Residentes</span>
         </a>
-        <a class="nav-item" href="javascript:void(0)">
+        <a
+          class="nav-item"
+          :class="{ 'is-active': vistaActual === 'mensajes' }"
+          href="javascript:void(0)"
+          @click="cambiarVista('mensajes')"
+        >
           <span class="nav-ico">💬</span>
           <span>Mensajes</span>
         </a>
@@ -484,12 +798,20 @@ onMounted(() => {
     <main class="main">
       <div class="topbar">
         <div class="topbar-left">
-          <div class="page-title">Dashboard</div>
-          <div class="page-subtitle">Vista general del condominio</div>
+          <div class="page-title">{{ tituloVista }}</div>
+          <div class="page-subtitle">{{ subtituloVista }}</div>
         </div>
 
         <div class="topbar-right">
-          <div class="search">
+          <div v-if="vistaActual === 'residentes'" class="search">
+            <span class="search-ico">⌕</span>
+            <input
+              v-model="buscarResidente"
+              class="search-input"
+              placeholder="Buscar por nombre o correo..."
+            />
+          </div>
+          <div v-else class="search">
             <span class="search-ico">⌕</span>
             <input class="search-input" placeholder="Buscar..." />
           </div>
@@ -504,92 +826,166 @@ onMounted(() => {
       </div>
 
       <div class="content">
-        <!-- Panel de administrador (mismo contenido, nuevo look) -->
-        <div v-if="esAdmin" class="card admin-card-shell">
-          <div class="card-head">
+        <!-- Vista Residentes (solo admin) -->
+        <div v-if="esAdmin && vistaActual === 'residentes'" class="residentes-shell card">
+          <div class="residentes-head">
             <div>
-              <div class="card-title">Administrador</div>
-              <div class="card-subtitle">Acciones rápidas</div>
+              <h3 class="admin-section-title">Residentes</h3>
+              <p class="admin-section-sub">Solo el administrador puede registrar usuarios</p>
             </div>
-            <div class="admin-user-select">
-              <label>Residente</label>
-              <select v-model="adminUsuarioIdDestino">
-                <option v-for="u in usuarios" :key="u.id" :value="u.id">
-                  {{ u.nombre }} ({{ u.correo }}) - {{ u.rol }}
-                </option>
-              </select>
-            </div>
+            <button type="button" class="btn-accent" @click="abrirFormUsuario()">
+              + Nuevo residente
+            </button>
           </div>
 
-          <div class="admin-grid">
-            <div class="admin-card">
-              <h4>Nueva multa</h4>
-              <input v-model="formMulta.descripcion" placeholder="Descripción" />
-              <input v-model="formMulta.monto" type="number" step="0.01" placeholder="Monto" />
-              <input v-model="formMulta.detalles" placeholder="Detalles (opcional)" />
-              <button
-                class="admin-btn"
-                :disabled="estaCargando('multa')"
-                @click="crearMulta"
-              >
-                <Transition name="btn-swap" mode="out-in">
-                  <span v-if="estaCargando('multa')" key="loading" class="btn-estado btn-estado--loading">
-                    <span class="spinner" aria-hidden="true" />
-                    Cargando...
-                  </span>
-                  <span v-else key="idle" class="btn-estado">Crear multa</span>
-                </Transition>
-              </button>
-            </div>
-
-            <div class="admin-card">
-              <h4>Pago atrasado</h4>
-              <input v-model="formPago.concepto" placeholder="Concepto" />
-              <input v-model="formPago.monto" type="number" step="0.01" placeholder="Monto" />
-              <input v-model="formPago.dias_atraso" type="number" placeholder="Días de atraso" />
-              <input v-model="formPago.fecha_vencimiento" type="datetime-local" />
-              <input v-model="formPago.detalles" placeholder="Detalles (opcional)" />
-              <button
-                class="admin-btn"
-                :disabled="estaCargando('pago')"
-                @click="crearPagoAtrasado"
-              >
-                <Transition name="btn-swap" mode="out-in">
-                  <span v-if="estaCargando('pago')" key="loading" class="btn-estado btn-estado--loading">
-                    <span class="spinner" aria-hidden="true" />
-                    Cargando...
-                  </span>
-                  <span v-else key="idle" class="btn-estado">Crear pago atrasado</span>
-                </Transition>
-              </button>
-            </div>
-
-            <div class="admin-card">
-              <h4>Asamblea</h4>
-              <input v-model="formAsamblea.titulo" placeholder="Título" />
-              <input v-model="formAsamblea.descripcion" placeholder="Descripción" />
-              <input v-model="formAsamblea.fecha" type="datetime-local" />
-              <input v-model="formAsamblea.lugar" placeholder="Lugar" />
-              <input v-model="formAsamblea.agenda" placeholder="Agenda (opcional)" />
-              <button
-                class="admin-btn"
-                :disabled="estaCargando('asamblea')"
-                @click="crearAsamblea"
-              >
-                <Transition name="btn-swap" mode="out-in">
-                  <span v-if="estaCargando('asamblea')" key="loading" class="btn-estado btn-estado--loading">
-                    <span class="spinner" aria-hidden="true" />
-                    Cargando...
-                  </span>
-                  <span v-else key="idle" class="btn-estado">Crear asamblea</span>
-                </Transition>
-              </button>
-            </div>
+          <div class="residentes-table-wrap">
+            <table class="residentes-table">
+              <thead>
+                <tr>
+                  <th>Residente</th>
+                  <th>Correo</th>
+                  <th>Rol</th>
+                  <th>Estado</th>
+                  <th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="u in residentesFiltrados" :key="u.id">
+                  <td>
+                    <div class="residente-cell">
+                      <span class="residente-avatar">{{ iniciales(u.nombre) }}</span>
+                      <span class="residente-nombre">{{ u.nombre }}</span>
+                    </div>
+                  </td>
+                  <td>{{ u.correo }}</td>
+                  <td><span class="rol-pill">{{ u.rol }}</span></td>
+                  <td>
+                    <span
+                      :class="[
+                        'estado-pill',
+                        estaVerificado(u) ? 'estado-pill--pagada' : 'estado-pill--pendiente',
+                      ]"
+                    >
+                      {{ estaVerificado(u) ? 'Verificado' : 'Pendiente' }}
+                    </span>
+                  </td>
+                  <td>
+                    <div class="residente-actions">
+                      <button
+                        type="button"
+                        class="icon-btn"
+                        title="Editar"
+                        @click="abrirFormUsuario(u)"
+                      >
+                        ✎
+                      </button>
+                      <button
+                        v-if="!estaVerificado(u)"
+                        type="button"
+                        class="icon-btn"
+                        title="Reenviar verificación"
+                        @click="reenviarVerificacion(u)"
+                      >
+                        ✉
+                      </button>
+                      <button
+                        type="button"
+                        class="icon-btn icon-btn--danger"
+                        title="Eliminar"
+                        @click="eliminarUsuario(u)"
+                      >
+                        🗑
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-if="residentesFiltrados.length === 0" class="admin-empty">
+              No hay residentes registrados.
+            </p>
           </div>
         </div>
 
-        <!-- Mensajes (misma data, estilo tipo panel) -->
-        <div class="card messages-shell">
+        <!-- Panel administrador: dashboard -->
+        <div v-if="esAdmin && vistaActual === 'dashboard'" class="admin-shell">
+          <div class="admin-layout">
+            <div class="admin-main-col">
+              <section class="admin-section card">
+                <div class="admin-section-head">
+                  <div>
+                    <h3 class="admin-section-title">Multas</h3>
+                    <p class="admin-section-sub">Registro y seguimiento de infracciones</p>
+                  </div>
+                  <button type="button" class="btn-accent" @click="abrirModal('multa')">
+                    + Nueva multa
+                  </button>
+                </div>
+
+                <div class="admin-list">
+                  <TransitionGroup name="list-item">
+                    <div
+                      v-for="m in multasLista"
+                      :key="m.id"
+                      class="admin-list-row"
+                    >
+                      <div class="admin-list-main">
+                        <span class="admin-list-badge">{{ m.residente_nombre }}</span>
+                        <span class="admin-list-text">{{ m.descripcion }}</span>
+                      </div>
+                      <div class="admin-list-meta">
+                        <span class="admin-list-monto">${{ Number(m.monto).toFixed(2) }}</span>
+                        <span :class="['estado-pill', `estado-pill--${m.estado}`]">
+                          {{ m.estado }}
+                        </span>
+                      </div>
+                    </div>
+                  </TransitionGroup>
+                  <p v-if="multasLista.length === 0" class="admin-empty">
+                    No hay multas. Pulsa «Nueva multa» para registrar una.
+                  </p>
+                </div>
+              </section>
+
+              <div class="admin-quick-actions">
+                <button type="button" class="btn-accent-outline" @click="abrirModal('pago')">
+                  + Pago atrasado
+                </button>
+                <button type="button" class="btn-accent-outline" @click="abrirModal('asamblea')">
+                  + Nueva asamblea
+                </button>
+              </div>
+            </div>
+
+            <aside class="admin-historial card">
+              <h3 class="admin-section-title">Historial</h3>
+              <p class="admin-section-sub">Acciones realizadas en esta sesión</p>
+
+              <div class="historial-list">
+                <TransitionGroup name="historial">
+                  <div
+                    v-for="h in historial"
+                    :key="h.id"
+                    class="historial-item"
+                  >
+                    <span class="historial-icon">{{ tiposIconos[h.tipo] || '•' }}</span>
+                    <div class="historial-body">
+                      <div class="historial-titulo">{{ h.titulo }}</div>
+                      <div class="historial-sub">{{ h.subtitulo }}</div>
+                      <div class="historial-time">{{ haceCuanto(h.fecha) }}</div>
+                    </div>
+                  </div>
+                </TransitionGroup>
+                <p v-if="historial.length === 0" class="admin-empty">
+                  Aún no hay acciones. Al crear multas, pagos o asambleas aparecerán aquí.
+                </p>
+              </div>
+            </aside>
+          </div>
+        </div>
+
+        <!-- Mensajes -->
+        <div v-if="vistaActual === 'mensajes' || !esAdmin" class="card messages-shell">
           <div class="card-head">
             <div>
               <div class="card-title">Mensajes</div>
@@ -736,6 +1132,215 @@ onMounted(() => {
     </div>
     </main>
   </div>
+
+  <!-- Modales administrador con transición -->
+  <Transition name="modal-fade">
+    <div
+      v-if="modalActivo && esAdmin"
+      class="admin-modal-overlay"
+      @click.self="cerrarModal"
+    >
+      <Transition name="modal-slide" appear>
+        <div
+          v-if="modalActivo"
+          class="admin-modal"
+          role="dialog"
+          aria-modal="true"
+          @click.stop
+        >
+          <!-- Modal Multa -->
+          <template v-if="modalActivo === 'multa'">
+            <h3 class="admin-modal-title">Nueva multa</h3>
+            <div class="admin-modal-field">
+              <label>Departamento</label>
+              <select v-model="adminUsuarioIdDestino">
+                <option v-for="u in usuarios.filter(x => x.rol !== 'admin')" :key="u.id" :value="u.id">
+                  {{ u.nombre }}
+                </option>
+              </select>
+            </div>
+            <div class="admin-modal-field">
+              <label>Motivo</label>
+              <input v-model="formMulta.descripcion" placeholder="Ej: Ruido excesivo" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Monto ($)</label>
+              <input v-model="formMulta.monto" type="number" step="0.01" placeholder="0.00" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Estado</label>
+              <select v-model="formMulta.estado">
+                <option value="pendiente">Pendiente</option>
+                <option value="pagada">Pagada</option>
+                <option value="cancelada">Cancelada</option>
+              </select>
+            </div>
+            <div class="admin-modal-field">
+              <label>Fecha límite (opcional)</label>
+              <input v-model="formMulta.fecha_vencimiento" type="date" />
+            </div>
+            <div class="admin-modal-actions">
+              <button type="button" class="btn-ghost" @click="cerrarModal">Cancelar</button>
+              <button
+                type="button"
+                class="btn-accent"
+                :disabled="estaCargando('multa')"
+                @click="crearMulta"
+              >
+                <Transition name="btn-swap" mode="out-in">
+                  <span v-if="estaCargando('multa')" key="loading" class="btn-estado btn-estado--loading">
+                    <span class="spinner spinner--light" aria-hidden="true" />
+                    Cargando...
+                  </span>
+                  <span v-else key="idle" class="btn-estado">Crear multa</span>
+                </Transition>
+              </button>
+            </div>
+          </template>
+
+          <!-- Modal Pago atrasado -->
+          <template v-else-if="modalActivo === 'pago'">
+            <h3 class="admin-modal-title">Pago atrasado</h3>
+            <div class="admin-modal-field">
+              <label>Residente</label>
+              <select v-model="adminUsuarioIdDestino">
+                <option v-for="u in usuarios.filter(x => x.rol !== 'admin')" :key="u.id" :value="u.id">
+                  {{ u.nombre }}
+                </option>
+              </select>
+            </div>
+            <div class="admin-modal-field">
+              <label>Concepto</label>
+              <input v-model="formPago.concepto" placeholder="Ej: Cuota de mantenimiento" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Monto ($)</label>
+              <input v-model="formPago.monto" type="number" step="0.01" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Días de atraso</label>
+              <input v-model="formPago.dias_atraso" type="number" min="0" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Fecha de vencimiento</label>
+              <input v-model="formPago.fecha_vencimiento" type="datetime-local" />
+            </div>
+            <div class="admin-modal-actions">
+              <button type="button" class="btn-ghost" @click="cerrarModal">Cancelar</button>
+              <button
+                type="button"
+                class="btn-accent"
+                :disabled="estaCargando('pago')"
+                @click="crearPagoAtrasado"
+              >
+                <Transition name="btn-swap" mode="out-in">
+                  <span v-if="estaCargando('pago')" key="loading" class="btn-estado btn-estado--loading">
+                    <span class="spinner spinner--light" aria-hidden="true" />
+                    Cargando...
+                  </span>
+                  <span v-else key="idle" class="btn-estado">Registrar pago</span>
+                </Transition>
+              </button>
+            </div>
+          </template>
+
+          <!-- Modal Asamblea -->
+          <template v-else-if="modalActivo === 'asamblea'">
+            <h3 class="admin-modal-title">Nueva asamblea</h3>
+            <div class="admin-modal-field">
+              <label>Título</label>
+              <input v-model="formAsamblea.titulo" placeholder="Asamblea general" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Descripción</label>
+              <input v-model="formAsamblea.descripcion" placeholder="Temas a tratar" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Fecha y hora</label>
+              <input v-model="formAsamblea.fecha" type="datetime-local" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Lugar</label>
+              <input v-model="formAsamblea.lugar" placeholder="Salón de eventos" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Agenda (opcional)</label>
+              <input v-model="formAsamblea.agenda" placeholder="Puntos del orden del día" />
+            </div>
+            <div class="admin-modal-actions">
+              <button type="button" class="btn-ghost" @click="cerrarModal">Cancelar</button>
+              <button
+                type="button"
+                class="btn-accent"
+                :disabled="estaCargando('asamblea')"
+                @click="crearAsamblea"
+              >
+                <Transition name="btn-swap" mode="out-in">
+                  <span v-if="estaCargando('asamblea')" key="loading" class="btn-estado btn-estado--loading">
+                    <span class="spinner spinner--light" aria-hidden="true" />
+                    Cargando...
+                  </span>
+                  <span v-else key="idle" class="btn-estado">Crear asamblea</span>
+                </Transition>
+              </button>
+            </div>
+          </template>
+
+          <!-- Modal Usuario (CRUD admin) -->
+          <template v-else-if="modalActivo === 'usuario'">
+            <h3 class="admin-modal-title">
+              {{ formUsuario.id ? 'Editar residente' : 'Nuevo residente' }}
+            </h3>
+            <p v-if="!formUsuario.id" class="modal-hint">
+              Se enviará un correo de verificación al registrarse. Solo el admin puede crear usuarios.
+            </p>
+            <div class="admin-modal-field">
+              <label>Nombre</label>
+              <input v-model="formUsuario.nombre" placeholder="Nombre completo" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Correo</label>
+              <input v-model="formUsuario.correo" type="email" placeholder="correo@ejemplo.com" />
+            </div>
+            <div class="admin-modal-field">
+              <label>{{ formUsuario.id ? 'Nueva contraseña (opcional)' : 'Contraseña' }}</label>
+              <input v-model="formUsuario.password" type="password" placeholder="••••••••" />
+            </div>
+            <div class="admin-modal-field">
+              <label>Rol</label>
+              <select v-model="formUsuario.rol">
+                <option value="usuario">Residente</option>
+                <option value="admin">Administrador</option>
+              </select>
+            </div>
+            <div class="admin-modal-actions">
+              <button type="button" class="btn-ghost" @click="cerrarModal">Cancelar</button>
+              <button
+                type="button"
+                class="btn-accent"
+                :disabled="estaCargando(formUsuario.id ? `usuario-edit-${formUsuario.id}` : 'usuario-create')"
+                @click="guardarUsuario"
+              >
+                <Transition name="btn-swap" mode="out-in">
+                  <span
+                    v-if="estaCargando(formUsuario.id ? `usuario-edit-${formUsuario.id}` : 'usuario-create')"
+                    key="loading"
+                    class="btn-estado btn-estado--loading"
+                  >
+                    <span class="spinner spinner--light" aria-hidden="true" />
+                    Cargando...
+                  </span>
+                  <span v-else key="idle" class="btn-estado">
+                    {{ formUsuario.id ? 'Guardar cambios' : 'Registrar y enviar correo' }}
+                  </span>
+                </Transition>
+              </button>
+            </div>
+          </template>
+        </div>
+      </Transition>
+    </div>
+  </Transition>
 
   <!-- Alerta global: resultado de la promesa HTTP -->
   <Transition name="alert-slide">
@@ -1167,70 +1772,474 @@ body {
   opacity: 0.6;
 }
 
-.admin-card-shell .admin-user-select {
-  min-width: 320px;
+/* Panel administrador */
+.admin-shell {
+  --accent: #0b0b0b;
+  --accent-hover: #000;
+  --accent-soft: #f5a623;
 }
 
-.admin-user-select label {
+.admin-layout {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+  align-items: start;
+}
+
+.admin-section {
+  padding: 0;
+  overflow: hidden;
+}
+
+.admin-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid #eef2f7;
+  background: linear-gradient(180deg, #fafafa, #fff);
+}
+
+.admin-section-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 900;
+  color: #0f172a;
+}
+
+.admin-section-sub {
+  margin: 4px 0 0;
   font-size: 12px;
   color: #64748b;
+}
+
+.btn-accent {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
   font-weight: 800;
-  margin-bottom: 6px;
-  display: block;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 8px 20px rgba(11, 11, 11, 0.18);
+  transition: background 0.2s ease, transform 0.2s ease;
 }
 
-.admin-user-select select {
-  width: 100%;
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid #e5e7eb;
+.btn-accent:hover:not(:disabled) {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+}
+
+.btn-accent:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.btn-accent-outline {
+  padding: 10px 16px;
+  border: 1px solid #0f172a;
+  border-radius: 10px;
   background: #fff;
+  color: #0f172a;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
 }
 
-.admin-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+.btn-accent-outline:hover {
+  background: #0f172a;
+  color: #fff;
+}
+
+.btn-ghost {
+  padding: 10px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #fff;
+  color: #64748b;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.admin-list {
+  padding: 8px 0;
+}
+
+.admin-list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 12px;
-  padding: 14px 14px 16px;
+  padding: 14px 20px;
+  border-bottom: 1px solid #f1f5f9;
+  transition: background 0.2s ease;
 }
 
-.admin-card {
-  border: 1px solid #eef2f7;
-  background: #fbfbfb;
-  border-radius: 14px;
-  padding: 12px;
+.admin-list-row:hover {
+  background: #fafafa;
+}
+
+.admin-list-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.admin-list-badge {
+  font-size: 12px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.admin-list-text {
+  font-size: 13px;
+  color: #64748b;
+}
+
+.admin-list-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.admin-list-monto {
+  font-weight: 900;
+  color: #0f172a;
+  font-size: 14px;
+}
+
+.estado-pill {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: capitalize;
+  padding: 4px 10px;
+  border-radius: 999px;
+}
+
+.estado-pill--pendiente {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.estado-pill--pagada {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.estado-pill--cancelada {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.admin-empty {
+  padding: 24px 20px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 13px;
+  margin: 0;
+}
+
+.admin-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.admin-historial {
+  padding: 18px 16px;
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+}
+
+.historial-list {
+  margin-top: 14px;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.admin-card h4 {
-  margin: 0;
+.historial-item {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #eef2f7;
+}
+
+.historial-icon {
+  font-size: 1.25rem;
+  flex-shrink: 0;
+}
+
+.historial-titulo {
   font-size: 13px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.historial-sub {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+.historial-time {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 6px;
+}
+
+/* Transición lista multas / historial */
+.list-item-enter-active,
+.list-item-leave-active {
+  transition: all 0.35s ease;
+}
+
+.list-item-enter-from {
+  opacity: 0;
+  transform: translateX(-12px);
+}
+
+.list-item-leave-to {
+  opacity: 0;
+  transform: translateX(12px);
+}
+
+.historial-enter-active,
+.historial-leave-active {
+  transition: all 0.35s ease;
+}
+
+.historial-enter-from {
+  opacity: 0;
+  transform: translateY(-10px);
+}
+
+.historial-leave-to {
+  opacity: 0;
+  transform: translateY(10px);
+}
+
+.historial-move {
+  transition: transform 0.35s ease;
+}
+
+/* Modales administrador */
+.admin-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  background: rgba(15, 23, 42, 0.45);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.admin-modal {
+  width: min(440px, 100%);
+  background: #fff;
+  border-radius: 14px;
+  padding: 24px 22px 20px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.22);
+}
+
+.admin-modal-title {
+  margin: 0 0 18px;
+  font-size: 1.15rem;
   font-weight: 900;
   color: #0f172a;
 }
 
-.admin-card input {
+.admin-modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.admin-modal-field label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #475569;
+}
+
+.admin-modal-field input,
+.admin-modal-field select {
   padding: 10px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  font-size: 14px;
+  outline: none;
+}
+
+.admin-modal-field input:focus,
+.admin-modal-field select:focus {
+  border-color: #0f172a;
+  box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.1);
+}
+
+.admin-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.modal-fade-enter-active,
+.modal-fade-leave-active {
+  transition: opacity 0.28s ease;
+}
+
+.modal-fade-enter-from,
+.modal-fade-leave-to {
+  opacity: 0;
+}
+
+.modal-slide-enter-active,
+.modal-slide-leave-active {
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.modal-slide-enter-from {
+  opacity: 0;
+  transform: translateY(24px) scale(0.96);
+}
+
+.modal-slide-leave-to {
+  opacity: 0;
+  transform: translateY(12px) scale(0.98);
+}
+
+.modal-hint {
+  margin: -8px 0 14px;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.45;
+}
+
+.auth-verify-banner {
+  margin-top: 16px;
+  padding: 12px 14px;
   border-radius: 12px;
-  border: 1px solid #e5e7eb;
-  background: #fff;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  font-size: 13px;
+  color: #92400e;
+  text-align: left;
+}
+
+/* CRUD Residentes */
+.residentes-shell {
+  padding: 0;
+  overflow: hidden;
+}
+
+.residentes-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.residentes-table-wrap {
+  overflow-x: auto;
+}
+
+.residentes-table {
+  width: 100%;
+  border-collapse: collapse;
   font-size: 13px;
 }
 
-.admin-btn {
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: none;
-  background: #0b0b0b;
-  color: #fff;
-  font-weight: 900;
-  cursor: pointer;
+.residentes-table th {
+  text-align: left;
+  padding: 12px 16px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #94a3b8;
+  border-bottom: 1px solid #eef2f7;
 }
 
-.admin-btn:hover {
-  background: #000;
+.residentes-table td {
+  padding: 14px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  vertical-align: middle;
+}
+
+.residente-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.residente-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  font-size: 12px;
+  color: #475569;
+}
+
+.residente-nombre {
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.rol-pill {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #475569;
+  text-transform: capitalize;
+}
+
+.residente-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  display: grid;
+  place-items: center;
+}
+
+.icon-btn:hover {
+  background: #f8fafc;
+}
+
+.icon-btn--danger:hover {
+  background: #fef2f2;
+  border-color: #fecaca;
 }
 
 .messages-shell .chat {
@@ -1874,8 +2883,18 @@ body {
     min-width: 180px;
   }
 
-  .admin-grid {
+  .admin-layout {
     grid-template-columns: 1fr;
+  }
+
+  .admin-historial {
+    position: static;
+    max-height: none;
+  }
+
+  .admin-section-head {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .message {
