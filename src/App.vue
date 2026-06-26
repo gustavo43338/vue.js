@@ -1,10 +1,24 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, nextTick } from 'vue'
 import api, { guardarSesion, limpiarSesion, obtenerToken } from './api'
 import echo from './echo'
 
 const email = ref('')
 const password = ref('')
+const forgotStep = ref('none')
+const forgotEmail = ref('')
+const forgotCodeDigits = ref(Array.from({ length: 6 }, () => ''))
+const forgotNewPassword = ref('')
+const forgotConfirmPassword = ref('')
+const codeInputs = ref([])
+
+const forgotCode = computed({
+  get: () => forgotCodeDigits.value.join(''),
+  set: (value) => {
+    const digits = String(value).replace(/\D/g, '').slice(0, 6).split('')
+    forgotCodeDigits.value = Array.from({ length: 6 }, (_, index) => digits[index] || '')
+  },
+})
 
 const usuarioActual = ref(null)
 try {
@@ -409,6 +423,116 @@ const login = () => {
   )
 }
 
+const iniciarRecuperacion = () => {
+  forgotStep.value = 'request'
+  forgotEmail.value = email.value.trim()
+  forgotCodeDigits.value = Array.from({ length: 6 }, () => '')
+  forgotNewPassword.value = ''
+  forgotConfirmPassword.value = ''
+}
+
+const cancelarRecuperacion = () => {
+  forgotStep.value = 'none'
+  forgotEmail.value = ''
+  forgotCodeDigits.value = Array.from({ length: 6 }, () => '')
+  forgotNewPassword.value = ''
+  forgotConfirmPassword.value = ''
+}
+
+const focusCodeInput = (index) => {
+  nextTick(() => {
+    const input = codeInputs.value?.[index]
+    if (input && typeof input.focus === 'function') {
+      input.focus()
+    }
+  })
+}
+
+const handleCodeInput = (event, index) => {
+  const value = String(event.target.value).replace(/\D/g, '').slice(0, 1)
+  forgotCodeDigits.value[index] = value
+  if (value && index < 5) {
+    focusCodeInput(index + 1)
+  }
+}
+
+const handleCodeKeydown = (event, index) => {
+  if (event.key === 'Backspace') {
+    if (forgotCodeDigits.value[index]) {
+      forgotCodeDigits.value[index] = ''
+    } else if (index > 0) {
+      forgotCodeDigits.value[index - 1] = ''
+      focusCodeInput(index - 1)
+    }
+  }
+}
+
+const handleCodePaste = (event) => {
+  const pasted = (event.clipboardData.getData('text') || '').replace(/\D/g, '').slice(0, 6)
+  forgotCodeDigits.value = Array.from({ length: 6 }, (_, index) => pasted[index] || '')
+  if (pasted.length < 6) {
+    focusCodeInput(pasted.length)
+  }
+}
+
+const enviarCodigoRecuperacion = () => {
+  const correo = forgotEmail.value.trim()
+  if (!correo) {
+    mostrarAlerta('error', 'Ingresa tu correo para recuperar tu contraseña')
+    return
+  }
+
+  return ejecutarPeticion(
+    'forgotPassword',
+    async () => {
+      await api.post('/password/forgot', { correo })
+    },
+    {
+      exito: 'Te enviamos un código al correo. Revisa tu bandeja de entrada.',
+      error: 'No se pudo enviar el correo de recuperación',
+    }
+  ).then(() => {
+    forgotStep.value = 'reset'
+  })
+}
+
+const restablecerContrasena = () => {
+  const correo = forgotEmail.value.trim()
+  const codigo = forgotCode.value.trim()
+  const nueva = forgotNewPassword.value
+  const confirmar = forgotConfirmPassword.value
+
+  if (!correo || !codigo || !nueva || !confirmar) {
+    mostrarAlerta('error', 'Completa todos los campos para restablecer tu contraseña')
+    return
+  }
+
+  if (nueva !== confirmar) {
+    mostrarAlerta('error', 'Las contraseñas no coinciden')
+    return
+  }
+
+  return ejecutarPeticion(
+    'resetPassword',
+    async () => {
+      await api.post('/password/reset', {
+        correo,
+        code: codigo,
+        password: nueva,
+        password_confirmation: confirmar,
+      })
+    },
+    {
+      exito: 'Contraseña restablecida correctamente. Ya puedes iniciar sesión.',
+      error: 'No se pudo restablecer la contraseña',
+    }
+  ).then(() => {
+    cancelarRecuperacion()
+    email.value = correo
+    password.value = ''
+  })
+}
+
 const logout = async () => {
   try {
     if (obtenerToken()) await api.post('/logout')
@@ -689,25 +813,99 @@ onMounted(async () => {
       <h1 class="auth-title">Bienvenido</h1>
       <p class="auth-subtitle">Inicia sesión en tu cuenta</p>
 
-      <div class="auth-field">
-        <label>Email</label>
-        <input v-model="email" placeholder="admin@ejemplo.com" type="email" />
-      </div>
+      <template v-if="forgotStep === 'none'">
+        <div class="auth-field">
+          <label>Email</label>
+          <input v-model="email" placeholder="admin@ejemplo.com" type="email" />
+        </div>
 
-      <div class="auth-field">
-        <label>Contraseña</label>
-        <input v-model="password" type="password" placeholder="••••••••" />
-      </div>
+        <div class="auth-field">
+          <label>Contraseña</label>
+          <input v-model="password" type="password" placeholder="••••••••" />
+        </div>
 
-      <div class="auth-row">
-        <label class="auth-check">
-          <input type="checkbox" disabled />
-          <span>Recordarme</span>
-        </label>
-        <a class="auth-link" href="javascript:void(0)">¿Olvidaste tu contraseña?</a>
+        <div class="auth-row">
+          <label class="auth-check">
+            <input type="checkbox" disabled />
+            <span>Recordarme</span>
+          </label>
+          <a class="auth-link" href="javascript:void(0)" @click="iniciarRecuperacion">¿Olvidaste tu contraseña?</a>
+        </div>
+      </template>
+
+      <div v-if="forgotStep !== 'none'" class="auth-recovery">
+        <div class="auth-recovery-header">
+          <h2>Recuperar contraseña</h2>
+          <p>Ingresa tu correo y el código que recibirás para crear una nueva contraseña.</p>
+        </div>
+        <div class="auth-field">
+          <label>Correo de recuperación</label>
+          <input v-model="forgotEmail" type="email" placeholder="correo@ejemplo.com" />
+        </div>
+        <button
+          class="auth-btn"
+          :disabled="estaCargando('forgotPassword')"
+          @click="enviarCodigoRecuperacion"
+        >
+          <Transition name="btn-swap" mode="out-in">
+            <span v-if="estaCargando('forgotPassword')" key="loading" class="btn-estado btn-estado--loading">
+              <span class="spinner" aria-hidden="true" />
+              Enviando código...
+            </span>
+            <span v-else key="idle" class="btn-estado">Enviar código de verificación</span>
+          </Transition>
+        </button>
+
+        <div v-if="forgotStep === 'reset'">
+          <div class="auth-field auth-field--code">
+            <label>Código de verificación</label>
+            <div class="auth-code-grid">
+              <input
+                v-for="(digit, index) in forgotCodeDigits"
+                :key="index"
+                ref="codeInputs"
+                class="auth-code-digit"
+                type="text"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                maxlength="1"
+                :value="digit"
+                @input="handleCodeInput($event, index)"
+                @keydown="handleCodeKeydown($event, index)"
+                @paste.prevent="handleCodePaste($event)"
+                autocomplete="one-time-code"
+                placeholder="•"
+              />
+            </div>
+          </div>
+          <div class="auth-field">
+            <label>Nueva contraseña</label>
+            <input v-model="forgotNewPassword" type="password" placeholder="••••••••" />
+          </div>
+          <div class="auth-field">
+            <label>Confirmar contraseña</label>
+            <input v-model="forgotConfirmPassword" type="password" placeholder="••••••••" />
+          </div>
+          <button
+            class="auth-btn"
+            :disabled="estaCargando('resetPassword')"
+            @click="restablecerContrasena"
+          >
+            <Transition name="btn-swap" mode="out-in">
+              <span v-if="estaCargando('resetPassword')" key="loading" class="btn-estado btn-estado--loading">
+                <span class="spinner" aria-hidden="true" />
+                Restableciendo...
+              </span>
+              <span v-else key="idle" class="btn-estado">Restablecer contraseña</span>
+            </Transition>
+          </button>
+        </div>
+
+        <button type="button" class="btn-ghost" @click="cancelarRecuperacion">Volver al login</button>
       </div>
 
       <button
+        v-if="forgotStep === 'none'"
         class="auth-btn"
         :disabled="estaCargando('login')"
         @click="login"
@@ -1393,10 +1591,10 @@ body {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(1200px 600px at 20% 30%, rgba(0,0,0,0.10), transparent 55%),
-    radial-gradient(900px 500px at 70% 20%, rgba(0,0,0,0.10), transparent 60%),
-    linear-gradient(180deg, rgba(0,0,0,0.28), rgba(0,0,0,0.28));
-  filter: saturate(0.9);
+    linear-gradient(180deg, rgba(15, 23, 42, 0.52), rgba(15, 23, 42, 0.28)),
+    url("https://images.unsplash.com/photo-1488747279002-c8523379faaa?auto=format&fit=crop&w=1500&q=80") center/cover no-repeat;
+  background-attachment: fixed;
+  filter: saturate(0.92) brightness(0.86);
 }
 
 .auth-shell::before {
@@ -1404,51 +1602,93 @@ body {
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(120deg, rgba(15, 23, 42, 0.25), rgba(15, 23, 42, 0.1)),
-    radial-gradient(900px 600px at 60% 40%, rgba(255,255,255,0.10), transparent 55%);
+    radial-gradient(circle at top left, rgba(255,255,255,0.12), transparent 22%),
+    radial-gradient(circle at bottom right, rgba(255,255,255,0.08), transparent 18%);
   pointer-events: none;
 }
 
 .auth-card {
   position: relative;
-  width: min(520px, 92vw);
+  width: min(420px, 90vw);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 249, 251, 0.98));
+  border-radius: 42px;
+  padding: 42px 34px 30px;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  box-shadow: 0 40px 100px rgba(15, 23, 42, 0.18);
+  backdrop-filter: blur(20px);
+}
+
+.auth-recovery {
+  margin-top: 22px;
+  padding: 26px;
+  border-radius: 28px;
   background: #ffffff;
-  border-radius: 18px;
-  padding: 34px 34px 26px;
-  box-shadow: 0 30px 80px rgba(0,0,0,0.35);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  box-shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+}
+
+.auth-recovery-header {
+  margin-bottom: 18px;
+}
+
+.auth-recovery-header h2 {
+  margin: 0 0 6px;
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: #111827;
+}
+
+.auth-recovery-header p {
+  margin: 0;
+  color: #475569;
+  font-size: 0.96rem;
+  line-height: 1.6;
+}
+
+.auth-recovery .auth-field {
+  margin-top: 16px;
+}
+
+.auth-recovery-note {
+  margin: 16px 0 0;
+  color: #6b7280;
+  font-size: 0.92rem;
+  line-height: 1.6;
 }
 
 .auth-logo {
-  width: 44px;
-  height: 44px;
+  width: 52px;
+  height: 52px;
   border-radius: 999px;
   display: grid;
   place-items: center;
-  margin: 0 auto 14px;
-  background: #0b1220;
+  margin: 0 auto 18px;
+  background: rgba(255, 255, 255, 0.18);
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18);
 }
 
 .auth-logo-dot {
-  width: 16px;
-  height: 16px;
-  border-radius: 6px;
-  background: linear-gradient(180deg, #9aa4b2, #5b6472);
+  width: 18px;
+  height: 18px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #2f80ed, #5b8cff);
 }
 
 .auth-title {
   margin: 0;
   text-align: center;
-  font-size: 28px;
-  font-weight: 800;
-  letter-spacing: -0.02em;
-  color: #0f172a;
+  font-size: 34px;
+  font-weight: 900;
+  letter-spacing: -0.04em;
+  color: #111827;
 }
 
 .auth-subtitle {
-  margin: 6px 0 20px;
+  margin: 8px 0 22px;
   text-align: center;
-  color: #64748b;
-  font-size: 14px;
+  color: #475569;
+  font-size: 15px;
+  line-height: 1.6;
 }
 
 .auth-field {
@@ -1466,17 +1706,58 @@ body {
 
 .auth-field input {
   width: 100%;
-  padding: 12px 14px;
-  border: 1px solid #e2e8f0;
-  border-radius: 12px;
-  background: #ffffff;
-  font-size: 14px;
+  padding: 16px 18px;
+  border: 1px solid #e5e7eb;
+  border-radius: 22px;
+  background: #f7f9fc;
+  font-size: 15px;
   outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
 }
 
 .auth-field input:focus {
-  border-color: #0f172a;
-  box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.12);
+  border-color: #2f80ed;
+  box-shadow: 0 0 0 4px rgba(47, 128, 237, 0.12);
+  transform: translateY(-1px);
+}
+
+.auth-field--code {
+  margin-top: 20px;
+}
+
+.auth-field--code .auth-code-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(56px, 1fr));
+  gap: 12px;
+}
+
+.auth-code-digit {
+  width: 100%;
+  min-height: 68px;
+  border-radius: 22px;
+  border: 1px solid #dae3ef;
+  background: #ffffff;
+  color: #111827;
+  font-size: 1.4rem;
+  font-weight: 900;
+  text-align: center;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+  letter-spacing: 0.36em;
+}
+
+.auth-code-digit::placeholder {
+  color: #cbd5e1;
+}
+
+.auth-code-digit:focus {
+  border-color: #2f80ed;
+  box-shadow: 0 0 0 5px rgba(47, 128, 237, 0.18);
+  transform: translateY(-1px);
+}
+
+.auth-field--code label {
+  margin-bottom: 12px;
 }
 
 .auth-row {
@@ -1501,10 +1782,11 @@ body {
 }
 
 .auth-link {
-  color: #0f172a;
+  color: #2563eb;
   font-size: 13px;
   text-decoration: none;
-  opacity: 0.85;
+  opacity: 0.95;
+  font-weight: 700;
 }
 
 .auth-link:hover {
@@ -1514,18 +1796,44 @@ body {
 
 .auth-btn {
   width: 100%;
-  padding: 12px 14px;
+  padding: 16px 20px;
   border: none;
-  border-radius: 12px;
-  background: #0b0b0b;
+  border-radius: 20px;
+  background: #111827;
   color: #fff;
   font-weight: 800;
+  font-size: 15px;
   cursor: pointer;
-  box-shadow: 0 12px 30px rgba(0,0,0,0.22);
+  box-shadow: 0 24px 50px rgba(17, 24, 39, 0.18);
+  transition: transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
 }
 
 .auth-btn:hover {
-  background: #000;
+  background: #0f172a;
+  transform: translateY(-2px);
+  box-shadow: 0 24px 60px rgba(17, 24, 39, 0.22);
+}
+
+.auth-btn:disabled {
+  opacity: 0.75;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.btn-ghost {
+  width: 100%;
+  padding: 14px 18px;
+  border: 1px solid #d1d5db;
+  border-radius: 18px;
+  background: #ffffff;
+  color: #475569;
+  font-weight: 700;
+  cursor: pointer;
+  margin-top: 14px;
+}
+
+.btn-ghost:hover {
+  background: #f8fafc;
 }
 
 .auth-footnote {
