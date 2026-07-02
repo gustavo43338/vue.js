@@ -10,6 +10,7 @@ const forgotEmail = ref('')
 const forgotCodeDigits = ref(Array.from({ length: 6 }, () => ''))
 const forgotNewPassword = ref('')
 const forgotConfirmPassword = ref('')
+const forgotDebugCode = ref('')
 const codeInputs = ref([])
 
 const forgotCode = computed({
@@ -347,8 +348,19 @@ const ejecutarPeticion = async (key, fn, { exito, error } = {}) => {
     mostrarAlerta('success', exito || 'Operación completada correctamente')
     return resultado
   } catch (err) {
+    if (err?.response?.status === 401) {
+      await logout()
+      mostrarAlerta('error', 'Sesión expirada. Inicia sesión nuevamente.')
+      return
+    }
+
+    const validationErrors = err?.response?.data?.errors
+      ? Object.values(err.response.data.errors).flat().join(' ')
+      : null
+
     const mensaje =
       error ||
+      validationErrors ||
       err?.response?.data?.error ||
       err?.response?.data?.message ||
       (err?.response?.status >= 500
@@ -482,10 +494,13 @@ const enviarCodigoRecuperacion = () => {
     return
   }
 
+  forgotDebugCode.value = ''
+
   return ejecutarPeticion(
     'forgotPassword',
     async () => {
-      await api.post('/password/forgot', { correo })
+      const response = await api.post('/password/forgot', { correo })
+      forgotDebugCode.value = response.data?.debug_code || ''
     },
     {
       exito: 'Te enviamos un código al correo. Revisa tu bandeja de entrada.',
@@ -770,8 +785,7 @@ onMounted(async () => {
       usuarioActual.value = data.usuario
       guardarSesion(obtenerToken(), data.usuario)
     } catch {
-      limpiarSesion()
-      usuarioActual.value = null
+      await logout()
       return
     }
 
@@ -784,9 +798,12 @@ onMounted(async () => {
       await cargarMultasAdmin()
     }
   } else if (usuarioActual.value && !obtenerToken()) {
-    limpiarSesion()
-    usuarioActual.value = null
+    await logout()
   }
+
+  window.addEventListener('session-expired', async () => {
+    await logout()
+  })
 
   echo.channel('chat-channel')
     .listen('.nuevo-mensaje', (e) => {
@@ -808,7 +825,7 @@ onMounted(async () => {
     <div class="auth-backdrop" />
     <div class="auth-card">
       <div class="auth-logo">
-        <div class="auth-logo-dot" />
+        <span class="auth-logo-icon">🏢</span>
       </div>
       <h1 class="auth-title">Bienvenido</h1>
       <p class="auth-subtitle">Inicia sesión en tu cuenta</p>
@@ -857,6 +874,11 @@ onMounted(async () => {
         </button>
 
         <div v-if="forgotStep === 'reset'">
+          <div v-if="forgotDebugCode" class="auth-field auth-field--debug">
+            <label>Código temporal</label>
+            <div class="debug-code-box">{{ forgotDebugCode }}</div>
+            <p class="debug-help">El código solo se muestra en desarrollo cuando el correo no puede entregarse.</p>
+          </div>
           <div class="auth-field auth-field--code">
             <label>Código de verificación</label>
             <div class="auth-code-grid">
@@ -1591,10 +1613,10 @@ body {
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(180deg, rgba(15, 23, 42, 0.52), rgba(15, 23, 42, 0.28)),
-    url("https://images.unsplash.com/photo-1488747279002-c8523379faaa?auto=format&fit=crop&w=1500&q=80") center/cover no-repeat;
+    linear-gradient(180deg, rgba(15, 23, 42, 0.62), rgba(15, 23, 42, 0.3)),
+    url("https://inmobli.com/wp-content/uploads/2021/08/aerea-edificios-amenidades-2-ok-departamentos-diamante-queretaro-1.jpg") center/cover no-repeat;
   background-attachment: fixed;
-  filter: saturate(0.92) brightness(0.86);
+  filter: saturate(0.9) brightness(0.78);
 }
 
 .auth-shell::before {
@@ -1609,13 +1631,13 @@ body {
 
 .auth-card {
   position: relative;
-  width: min(420px, 90vw);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 249, 251, 0.98));
-  border-radius: 42px;
-  padding: 42px 34px 30px;
-  border: 1px solid rgba(255, 255, 255, 0.8);
-  box-shadow: 0 40px 100px rgba(15, 23, 42, 0.18);
-  backdrop-filter: blur(20px);
+  width: min(420px, 92vw);
+  background: #ffffff;
+  border-radius: 32px;
+  padding: 36px 28px 32px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  box-shadow: 0 34px 90px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(12px);
 }
 
 .auth-recovery {
@@ -1663,15 +1685,18 @@ body {
   display: grid;
   place-items: center;
   margin: 0 auto 18px;
-  background: rgba(255, 255, 255, 0.18);
-  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.18);
+  width: 72px;
+  height: 72px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: #111827;
+  box-shadow: 0 24px 50px rgba(15, 23, 42, 0.22);
 }
 
-.auth-logo-dot {
-  width: 18px;
-  height: 18px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #2f80ed, #5b8cff);
+.auth-logo-icon {
+  font-size: 1.85rem;
+  color: #ffffff;
 }
 
 .auth-title {
@@ -1684,11 +1709,11 @@ body {
 }
 
 .auth-subtitle {
-  margin: 8px 0 22px;
+  margin: 8px 0 24px;
   text-align: center;
-  color: #475569;
+  color: #64748b;
   font-size: 15px;
-  line-height: 1.6;
+  line-height: 1.7;
 }
 
 .auth-field {
@@ -1723,27 +1748,31 @@ body {
 
 .auth-field--code {
   margin-top: 20px;
+  overflow: hidden;
 }
 
 .auth-field--code .auth-code-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(56px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 16px;
+  padding: 0 8px;
 }
 
 .auth-code-digit {
   width: 100%;
-  min-height: 68px;
+  min-height: 72px;
+  min-width: 0;
   border-radius: 22px;
-  border: 1px solid #dae3ef;
+  border: 2px solid #dae3ef;
   background: #ffffff;
-  color: #111827;
-  font-size: 1.4rem;
+  color: #000000;
+  font-size: 3rem;
   font-weight: 900;
   text-align: center;
   outline: none;
   transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
-  letter-spacing: 0.36em;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
 }
 
 .auth-code-digit::placeholder {
@@ -1765,14 +1794,14 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin: 14px 0 18px;
+  margin: 16px 0 18px;
 }
 
 .auth-check {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  color: #64748b;
+  gap: 12px;
+  color: #475569;
   font-size: 13px;
 }
 
@@ -1782,10 +1811,10 @@ body {
 }
 
 .auth-link {
-  color: #2563eb;
+  color: #111827;
   font-size: 13px;
   text-decoration: none;
-  opacity: 0.95;
+  opacity: 0.9;
   font-weight: 700;
 }
 
@@ -1796,15 +1825,15 @@ body {
 
 .auth-btn {
   width: 100%;
-  padding: 16px 20px;
+  padding: 18px 20px;
   border: none;
-  border-radius: 20px;
+  border-radius: 18px;
   background: #111827;
   color: #fff;
   font-weight: 800;
   font-size: 15px;
   cursor: pointer;
-  box-shadow: 0 24px 50px rgba(17, 24, 39, 0.18);
+  box-shadow: 0 24px 40px rgba(17, 24, 39, 0.18);
   transition: transform 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
 }
 
@@ -3207,6 +3236,28 @@ body {
 
   .message {
     max-width: 85vw;
+  }
+
+  .auth-card {
+    width: min(100%, 100vw);
+    margin: 0 auto;
+    padding: 28px 22px 30px;
+    border-radius: 36px;
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    background: rgba(255, 255, 255, 0.94);
+  }
+
+  .auth-recovery {
+    padding: 22px;
+  }
+
+  .auth-code-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .auth-code-digit {
+    min-height: 52px;
   }
 }
 

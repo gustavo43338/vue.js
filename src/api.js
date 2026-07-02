@@ -24,6 +24,7 @@ api.interceptors.response.use(
     if (error.response?.status === 401) {
       localStorage.removeItem('token')
       localStorage.removeItem('usuario')
+      window.dispatchEvent(new CustomEvent('session-expired'))
     }
     return Promise.reject(error)
   }
